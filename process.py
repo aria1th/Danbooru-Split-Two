@@ -1,4 +1,5 @@
 from functools import lru_cache
+import shutil
 from ultralytics import YOLO
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 import multiprocessing
@@ -18,13 +19,14 @@ from tqdm import tqdm
 import json
 
 gpus = tf.config.list_physical_devices('GPU')
+print(f"Found {len(gpus)} GPUs")
 assert len(gpus) > 0, "No GPUs available"
 IMAGE_SIZE = 448
 INTERPOLATION = cv2.INTER_AREA
 REPOSITORY = "SmilingWolf/wd-v1-4-moat-tagger-v2" #moat or etc 
 DTYPE = np.float16
 # global params, models, general_tags, character_tags, rating_tags
-model:tf.keras.models.Model = None
+models = {}
 general_tags:list|None = None
 character_tags:list|None = None
 
@@ -37,6 +39,8 @@ if gpus:
             tf.config.experimental.set_memory_growth(gpu, True)
     except RuntimeError as e:
         print(e)
+
+TAG_DICT = {}
 
 def convert_images(image_paths: List[str]):
     """
@@ -99,7 +103,9 @@ def detect(imgs, cuda_device=0, model='yolov8n.pt', batch_size=-1,stream:bool=Fa
             return []
         thread_pool = ThreadPoolExecutor(max_workers=1) # 1 thread per device, allows asynchronous execution and preprocessing
         os.environ['CUDA_VISIBLE_DEVICES'] = str(cuda_device)
+        tf.config.set_visible_devices(tf.config.list_physical_devices('GPU')[int(cuda_device)], 'GPU') # set visible devices
         model = YOLO(model) #YOLO('yolov8n-face.pt') # for face only
+        model.to(f"cuda:{cuda_device}")
         model.conf = conf_threshold
         model.iou = iou_threshold
         model.imgsz = max_infer_size
@@ -196,8 +202,6 @@ def detect_and_save_cropped_images(image_paths: List[str], save_dir: str, cuda_d
         return
     result_container = detect(image_paths, cuda_device, model, batch_size, stream=True, max_infer_size=max_infer_size, conf_threshold=conf_threshold, iou_threshold=iou_threshold)
     for path, r in result_container:
-        #print(f'handling {path}')
-        #print(r.boxes)
         try:
             image = Image.open(path).convert("RGB")
         except Exception as e:
@@ -211,6 +215,9 @@ def detect_and_save_cropped_images(image_paths: List[str], save_dir: str, cuda_d
             logging.error(f"Expected 2 persons, got {len(xyxy)} for {path}")
             continue
         save_cropped_images(image, xyxy, path, save_dir)
+
+def init_process(gpu_id):
+    os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
 
 def execute_yolo(cuda_devices:str, image_path:str, recursive:bool, save_dir:str, batch_size:int, model:str = 'yolov8n.pt',
         max_infer_size:int = 640, conf_threshold:float = 0.3, iou_threshold:float = 0.5):
@@ -256,7 +263,7 @@ def execute_yolo(cuda_devices:str, image_path:str, recursive:bool, save_dir:str,
             results = []
             for cuda_device, image_paths in zip(available_cuda_devices, image_paths_split):
                 results.append(executor.submit(detect_and_save_cropped_images, image_paths, save_dir, cuda_device, batch_size=batch_size,model=model,
-                                max_infer_size=max_infer_size, conf_threshold=conf_threshold, iou_threshold=iou_threshold
+                                max_infer_size=max_infer_size, conf_threshold=conf_threshold, iou_threshold=iou_threshold,
                                 ))
             for result in results:
                 try:
@@ -338,17 +345,15 @@ def download_model(repo_dir: str = REPOSITORY, save_dir: str = "./", force_downl
     return os.path.abspath(save_dir)
 
 # check if model is already loaded in port 5050, if it is, use api
-def check_model_loaded():
+def check_model_loaded(cuda_devices:str="0"):
     """
-    Checks if model is loaded in port_number
-    port_number: port number to check (int)
-    ip: ip address to check (str) default: localhost
-    return: True if model is loaded, False otherwise (bool)
+    Checks if model is loaded
     """
-    return model is not None
+    global models
+    return models.get(cuda_devices, None) is not None
 
     
-def load_model(model_path: str = "./models", force_download: bool = False):
+def load_model(model_path: str = "./models", force_download: bool = False, cuda_devices:str="0"):
     """
     Loads model from model_path
     model_path: path to model (str)
@@ -356,17 +361,20 @@ def load_model(model_path: str = "./models", force_download: bool = False):
     port_number: port number to load model (int)
     return: None
     """
-    if check_model_loaded():
+    cuda_devices = str(cuda_devices)
+    if check_model_loaded(cuda_devices=cuda_devices):
         return None
     if not model_path:
         raise ValueError("model_path is None")
     if (not os.path.exists(model_path)) or force_download:
         download_model(REPOSITORY, model_path, force_download = force_download)
     # load model
-    global model
+    global model, models
     print("Loading model")
     # precisions
-    model = load_model_hf(model_path)
+    with tf.device(f"/gpu:{cuda_devices}"):
+        model = load_model_hf(model_path)
+        models[cuda_devices] = model
     return None
 
 def predict_tags(prob_list:np.ndarray, threshold=0.5, model_path:str="./") -> List[str]:
@@ -394,21 +402,6 @@ def predict_tags(prob_list:np.ndarray, threshold=0.5, model_path:str="./") -> Li
             result.append(tag_name)
     return result
 
-def predict_image(image: np.ndarray, model_path: str = "./") -> List[str]:
-    """
-    Predicts image from image
-    image: image to predict (np.ndarray)
-    model_path: path to model (str)
-    return: list of tags (list of str)
-    """
-    global model
-    if model is None:
-        load_model(model_path)
-    image = preprocess_image(image)
-    image = np.expand_dims(image, axis=0)
-    probs = model.predict(image)[0]
-    return predict_tags(probs, model_path=model_path)
-
 def predict_images_batch(images: Generator, model_path: str = "./", batch_size = 16, minibatch_size = 16,total:int=-1, action:callable = None, threadexecutor:ThreadPoolExecutor = None) -> List[List[str]]:
     """
     Predicts images from images
@@ -416,18 +409,21 @@ def predict_images_batch(images: Generator, model_path: str = "./", batch_size =
     model_path: path to model (str)
     return: list of tags (list of list of str)
     """
-    global model
-    if model is None:
-        load_model(model_path)
     assert images is not None, "images is None"
     #images = [preprocess_image(image) for image in images]
-    results = []
     full, partial = divmod(total, batch_size)
     total_batches = full + bool(partial)
     _total_done = 0
+    futures = []
+    models_available = list(models.values())
+    models_count = len(models_available)
+    if models_count == 0:
+        logging.error("No models available for tagger")
+        raise ValueError("No models available")
     for i in tqdm(range(total_batches), desc="GPU Batch"):
         batch = []
         paths = []
+        selected_model = models_available[i % models_count]
         for j in tqdm(range(batch_size), desc=f"Loading batch {i} over {total_batches}"):
             try:
                 path, image = next(images)
@@ -444,13 +440,17 @@ def predict_images_batch(images: Generator, model_path: str = "./", batch_size =
             _total_done += 1
         batch = np.array(batch_processed)
         # With proper handling, the later part can be threaded (GPU side, load next batch while predicting)
-        threadexecutor.submit(threaded_job, batch, paths, minibatch_size, model_path, action)
+        futures.append(threadexecutor.submit(threaded_job, batch, paths, minibatch_size, model_path, action, selected_model, i % models_count))
         #threaded_job(batch, paths, minibatch_size, model_path, action)
-    return results
+    return futures
 
-def threaded_job(batch, paths, minibatch_size, model_path, action):
+def threaded_job(batch, paths, minibatch_size, model_path, action, local_model, cuda_device):
+    """
+    Threaded job for predict_images_batch (Tagger)
+    """
     try:
-        probs = model.predict(batch, batch_size=minibatch_size)
+        with tf.device(f"/gpu:{cuda_device}"):
+            probs = local_model.predict(batch, batch_size=minibatch_size)
         # move to cpu (tensorflow-gpu)
         # clear session
         keras.backend.clear_session()
@@ -461,6 +461,7 @@ def threaded_job(batch, paths, minibatch_size, model_path, action):
         del probs
         if action is not None:
             action(paths, tags_batch)
+        return paths, tags_batch
     except Exception as e:
         print(e)
         if isinstance(e, KeyboardInterrupt):
@@ -486,20 +487,15 @@ def predict_images_from_path(image_paths: List[str], model_path: str = "./", act
     model_path: path to model (str)
     return: list of tags (list of list of str)
     """
-    # check if model is loaded
-    if not check_model_loaded():
-        global model
-        if model is None:
-            load_model(os.path.abspath(model_path))
     generator = handle_yield(image_paths)
-    executor = ThreadPoolExecutor(max_workers=1)
+    executor = ThreadPoolExecutor(max_workers=len(models))
     # batch size is 2048, minibatch size is 16 - batch size (RAM) / minibatch size (GPU)
     return predict_images_batch(generator, model_path=model_path, action=action, total=len(image_paths), batch_size=batch_size,minibatch_size = minibatch_size, threadexecutor=executor)
 
 # using glob, get all images in a folder then request
 def predict_local_path(path:str, recursive:bool=False, action:callable=None, max_items:int=0, batch_size=2048, minibatch_size=16) -> dict[str, List[str]]: # path: path to folder
     """
-    Predicts images from path
+    Predicts images from path (TAG)
     path: path to folder (str)
     model_path: path to model (str)
     return: list of tags (list of list of str)
@@ -521,7 +517,10 @@ def predict_local_path(path:str, recursive:bool=False, action:callable=None, max
     print(f"Found {len(paths)} images")
     # post and get
     result = predict_images_from_path(paths, action=action, batch_size=batch_size, minibatch_size=minibatch_size)
-    result_dict = {x[0]:x[1] for x in zip(paths, result)}
+    result_dict = {}
+    for futures in result:
+        paths, tags = futures.result()
+        result_dict.update({x[0]:x[1] for x in zip(paths, tags)})
     return result_dict
 
 def move_matching_items(paths:List[str], tags:List[List[str]]):
@@ -551,8 +550,20 @@ def save_to_file(paths:List[str], tags:List[List[str]]):
             continue
         with open(text_path, "w", encoding="utf-8") as f:
             f.write(f"{tag}")
-            
+
+def get_tags(tags_file_path) -> str:
+    """
+    Returns raw tag string from tags_file_path
+    """
+    if TAG_DICT:
+        return TAG_DICT[tags_file_path]
+    with open(tags_file_path, "r", encoding="utf-8") as f:
+        tag = f.read()
+    return tag
 def relocate_main(original_image_path, segmented_image_path, save=False):
+    """
+    Relocates tags from segmented images to original images.
+    """
     original_general_tags = {}
     result_dict = {}
     # EXTRACT GENERAL TAGS FROM ORIGINAL IMAGES
@@ -562,35 +573,46 @@ def relocate_main(original_image_path, segmented_image_path, save=False):
         if filename.endswith('.txt') and not filename.endswith('_relocated.txt'): #skip relocated txt files
             image_name = os.path.splitext(filename)[0]
             tags_file_path = os.path.join(original_image_path, filename)
-            original_general_tags[image_name] = extract_general_tags(tags_file_path)
-    
+            original_general_tags[image_name] = extract_general_tags(get_tags(tags_file_path))
+            print(original_general_tags[image_name])
             # PROCESS SEGMENTED IMAGES
             segmented_info = process_segmented_image(original_image_name, segmented_image_path)
             if not segmented_info:
                 continue
+            print(segmented_info)
             # SORT SEGMENTS BY HORIZONTAL CENTER AND GROUP TAGS
-            relocated_tags_line = sort_and_group_tags(segmented_info, original_general_tags.get(image_name, []))
+            relocated_tags_line = sort_and_group_tags(segmented_info, original_general_tags[image_name])
+            print(relocated_tags_line)
             result_dict[image_name] = relocated_tags_line
             # Save the relocated tags as new txt files
-            original_tags_file_path = os.path.join(original_image_path, f'{image_name}.txt')
+            
             save_path = os.path.join(original_image_path, f'{image_name}_relocated.txt')
             if save:
-                save_relocated_tags(save_path, open(original_tags_file_path, 'r').readlines(), relocated_tags_line)
+                original_tags_file_path = os.path.join(original_image_path, f'{image_name}.txt')
+                original_tags = get_tags(original_tags_file_path).split('\n')
+                save_relocated_tags(save_path, original_tags, relocated_tags_line)
     return result_dict
-                
-  
-def sort_and_group_tags(segmented_info, original_tags):
+
+def sort_and_group_tags(segmented_info:dict, original_tags: List[str]) -> str:
     # Sort segments by horizontal center
     sorted_segments = sorted(segmented_info.items(), key=lambda x: get_horizontal_center(x[1]['coords']) if x[1]['coords'] else float('inf'))
-    
+    allowed_tags = ["1girl", "1boy"]
+    replacing_map = {
+        "2girl": "1girl",
+        "2boy": "1boy",
+        "2girls" : "1girl",
+        "2boys" : "1boy"
+    }
     # Group the general tags by segment and order them from left to right
     matched_tag_list = []
     for segment_id, segment in sorted_segments:
         if 'tags' in segment:
-            common_tags = [tag for tag in original_tags if tag in segment['tags']]
+            common_tags = [replacing_map.get(tag, tag) for tag in original_tags if tag in segment['tags'] or tag in allowed_tags]
             matched_tag_list.append(common_tags)
             
-    flattened_matched_tags = [tag for sublist in matched_tag_list for tag in sublist]
+    flattened_matched_tags = []
+    for tags in matched_tag_list:
+        flattened_matched_tags.extend(tags)
     remaining_tags = [tag for tag in original_tags if tag not in flattened_matched_tags]
     # replace space in tag with '_'
     remaining_tags = [tag.replace(' ', '_') for tag in remaining_tags]
@@ -602,23 +624,23 @@ def sort_and_group_tags(segmented_info, original_tags):
     relocated_tags = ' '.join(remaining_tags)+(' ||| ' + relocated_tags if relocated_tags else '')
     return relocated_tags
   
-def normalize_tags(tags):
+def normalize_tags(tags) -> List[str]:
     """Normalizes tags by replacing underscores with spaces."""
     return [tag.replace('_', ' ') for tag in tags]  
 
-def extract_general_tags(tags_file):   
+def extract_general_tags(tags_content):   
     """Extracts general tags from the given tags file."""
-    with open(tags_file, 'r', encoding='utf-8') as file:
-        file_lines = file.readlines()
-        # if GENERAL_TAGS: line exists, extract tags from it
-        # else, everything is general tags
-        if any("GENERAL TAGS:" in line for line in file_lines):
-            for line in file_lines:
-                if 'GENERAL TAGS:' in line:
-                    general_tags = line.replace('GENERAL TAGS:', '').strip()
-                    return normalize_tags(general_tags.split())
-        else:
-            return normalize_tags(" ".join(file_lines).split())
+    file_lines = tags_content.split('\n')
+    # if GENERAL_TAGS: line exists, extract tags from it
+    # else, everything is general tags
+    if any("GENERAL TAGS:" in line for line in file_lines):
+        for line in file_lines:
+            if 'GENERAL TAGS:' in line:
+                general_tags = line.replace('GENERAL TAGS:', '').strip()
+                return normalize_tags(general_tags.split(","))
+        raise ValueError("GENERAL TAGS: line not found even though it exists")
+    else:
+        return normalize_tags(" ".join(file_lines).split((",")))
 
 
 def process_coordinates(coords_file):
@@ -677,7 +699,7 @@ def get_horizontal_center(coords):
     x1, _, x2, _ = coords
     return (x1 + x2) / 2  
 
-def save_relocated_tags(save_path, original_tag_lines, relocated_tag_lines):
+def save_relocated_tags(save_path, original_tag_lines:List[str], relocated_tag_lines:str):
     """Saves the relocated tags as a new txt file."""
     with open(save_path, 'w', encoding='utf-8') as file:
         if any("GENERAL TAGS:" in line for line in original_tag_lines):
@@ -689,8 +711,7 @@ def save_relocated_tags(save_path, original_tag_lines, relocated_tag_lines):
                     file.write(line)
         else:
             # replace all
-            for line in relocated_tag_lines:
-                file.write(line)
+            file.write(relocated_tag_lines)
 
 def save_to_json(original_image_path, json_path):
     """Saves the relocated tags and its image name as a new json file."""
@@ -713,7 +734,7 @@ def save_to_json(original_image_path, json_path):
     json_file_path = os.path.join(json_path)
     with open(json_file_path, 'w') as f:
         json.dump(json_data, f, indent=4)
-    
+
     
 if __name__ == '__main__':
     multiprocessing.set_start_method('spawn')
@@ -731,14 +752,38 @@ if __name__ == '__main__':
     parser.add_argument('--conf-threshold', type=float, default=0.3, help='confidence threshold')
     parser.add_argument('--iou-threshold', type=float, default=0.5, help='iou threshold')
     parser.add_argument('--save-json', type=str, required=True, help='directory to save json file')
+    parser.add_argument('--disable-remove', action='store_true', help='disable remove')
+    parser.add_argument('--load-json-path', type=str, default=None, help='load json path')
     args = parser.parse_args()
     
+    # check save-dir is not empty, it has to be either empty or not exist
+    assert not os.path.exists(args.save_dir) or not os.listdir(args.save_dir), f"save_dir {args.save_dir} is not empty!! Please empty it or use another directory"
     REPOSITORY = args.tagger_model
     import torch
     assert torch.cuda.is_available(), "No CUDA available"
+    if args.load_json_path:
+        files = glob.glob(args.load_json_path)
+        if not files:
+            raise ValueError(f"load_json_path {args.load_json_path} is not valid")
+        for file in files:
+            with open(file, 'r', encoding='utf-8') as f:
+                json_data = json.load(f)
+            for k, v in json_data.items():
+                filename_without_ext = k.rsplit('.', 1)[0] + '.txt'
+                if '|||' in v:
+                    v = v.split('|||')[-1]
+                v = v.replace(", ", ",")
+                v = v.replace(" ", "_") # replace space with _
+                TAG_DICT[filename_without_ext] = v
+        print(f"Loaded {len(TAG_DICT)} tags")
     execute_yolo(args.cuda_devices, args.image_path, args.recursive, args.save_dir, args.batch_size, args.yolo_model, args.max_infer_size, args.conf_threshold, args.iou_threshold)
-    
-    load_model(args.model_path, args.force_download) # Tagger
+    loading_future = []
+    with ThreadPoolExecutor(max_workers=len(args.cuda_devices.split(','))) as executor:
+        for device_id in args.cuda_devices.split(','):
+            loading_future.append(executor.submit(load_model, args.model_path, args.force_download, cuda_devices=str(device_id))) # Tagger
+        for future in loading_future:
+            future.result()
+        #load_model(args.model_path, args.force_download, cuda_devices=str(device_id)) # Tagger
     # adjust by yourself
     predict_local_path(args.save_dir, recursive=True, action=save_to_file, max_items = 0, batch_size=256, minibatch_size=32).values() # ban tags   
     
@@ -747,5 +792,9 @@ if __name__ == '__main__':
     
     with open(args.save_json, 'w', encoding='utf-8') as f:
         json.dump(result_dict, f, indent=4)
+    
+    if not args.disable_remove:
+        # remove save_dir
+        shutil.rmtree(args.save_dir)
     # save imagename:tags to json file
     #save_to_json(args.image_path, args.save_json)
