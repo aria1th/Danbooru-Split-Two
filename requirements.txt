@@ -1,0 +1,5 @@
+ultralytics
+torch
+tqdm
+tensorflow
+onnxruntime-gpu
